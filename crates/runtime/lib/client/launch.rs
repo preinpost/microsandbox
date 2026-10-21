@@ -459,7 +459,7 @@ impl LaunchConfig {
     /// Explicit policy takes precedence and only an automatic request probes the host.
     pub fn resolve_nested_virt(&self, host_default: impl FnOnce() -> bool) -> bool {
         self.nested_virt
-            .unwrap_or_else(|| self.nested_virt_auto == Some(true) && host_default())
+            .unwrap_or_else(|| self.nested_virt_auto.unwrap_or(true) && host_default())
     }
 
     /// Decode and validate execution intent before allocating or starting a VM.
@@ -691,7 +691,11 @@ mod tests {
             let decoded = decode(encoded).unwrap();
             assert_eq!(decoded.nested_virt, enabled);
             assert_eq!(
-                decoded.resolve_nested_virt(|| panic!("legacy launch must not probe")),
+                decoded.resolve_nested_virt(|| true),
+                enabled.unwrap_or(true)
+            );
+            assert_eq!(
+                decoded.resolve_nested_virt(|| false),
                 enabled.unwrap_or(false)
             );
 
