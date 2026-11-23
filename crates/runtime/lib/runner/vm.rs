@@ -300,6 +300,9 @@ pub struct VmConfig {
     /// Expose hardware virtualization capabilities to the guest.
     pub nested_virt: bool,
 
+    /// Host PCI devices (`DDDD:BB:DD.F`) passed through with VFIO. Empty disables passthrough.
+    pub pci_devices: Vec<String>,
+
     /// Host control over the guest wall clock during boot, restore, and resume.
     pub guest_clock: microsandbox_types::GuestClockPolicy,
 
@@ -514,6 +517,23 @@ struct TrampolineRootfsGuard {
 //--------------------------------------------------------------------------------------------------
 
 impl VmConfig {
+    /// VFIO maps guest RAM statically at boot, so passthrough cannot share a virtio-mem hotplug
+    /// region. Reject an explicit hotplug maximum here instead of letting `libkrun` fail later.
+    pub fn validate_pci_devices(&self) -> RuntimeResult<()> {
+        if self.pci_devices.is_empty() {
+            return Ok(());
+        }
+        microsandbox_types::normalize_pci_devices(&self.pci_devices)
+            .map_err(RuntimeError::Custom)?;
+        if self.max_memory_mib > self.memory_mib {
+            return Err(RuntimeError::Custom(
+                "PCI passthrough cannot be combined with memory hotplug; set max memory equal to memory"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Virtio-fs backend state budget in bytes.
     pub fn fs_state_limit(&self) -> usize {
         self.fs_state_limit_bytes
@@ -2056,6 +2076,7 @@ fn build_vm(
     let agent_queue_size = agent_primary_queue_size(bulk_console_backend.is_some());
     let vm = &config.vm;
     vm.validate_custom_backends()?;
+    vm.validate_pci_devices()?;
     let mut device_bindings = crate::checkpoint::CheckpointDeviceBindings::default();
     // Collects the runtime-owned bootstrap rootfs directories created for
     // unix block-root sandboxes; the caller reclaims them if this VM is
@@ -2151,6 +2172,12 @@ fn build_vm(
                 k
             }
         });
+
+    // Host PCI passthrough. `validate_pci_devices` already rejected hotplug memory, so this
+    // path never creates a virtio-mem device that would conflict with VFIO DMA mappings.
+    for bdf in &vm.pci_devices {
+        builder = builder.pci_vfio(bdf.clone());
+    }
 
     // Root filesystem.
     if let Some(ref rootfs_path) = vm.rootfs_path {
@@ -4550,6 +4577,24 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[cfg(unix)]
+    #[test]
+    fn pci_passthrough_validation_rejects_hotplug_memory_and_bad_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vm = build_vm_test_config(dir.path(), |_| {}).vm;
+        vm.validate_pci_devices().unwrap();
+        vm.pci_devices = vec!["0000:04:00.3".into()];
+        vm.validate_pci_devices().unwrap();
+        vm.max_memory_mib = vm.memory_mib + 256;
+        let error = vm.validate_pci_devices().unwrap_err();
+        assert!(error.to_string().contains("memory hotplug"), "{error}");
+        vm.max_memory_mib = vm.memory_mib;
+        vm.pci_devices = vec!["0000:04:00.3".into(), "0000:04:00.3".into()];
+        assert!(vm.validate_pci_devices().is_err());
+        vm.pci_devices = vec!["not-a-bdf".into()];
+        assert!(vm.validate_pci_devices().is_err());
+    }
+
     #[test]
     fn remove_trampoline_rootfs_dirs_tolerates_missing_directories() {
         let host = tempfile::tempdir().unwrap();
@@ -4589,6 +4634,7 @@ mod tests {
             libkrunfw_path: std::path::PathBuf::from("/nonexistent/libkrunfw.so"),
             thp: Default::default(),
             nested_virt: false,
+            pci_devices: Vec::new(),
             guest_clock: Default::default(),
             memory_cache_dir: None,
             vcpus: 1,

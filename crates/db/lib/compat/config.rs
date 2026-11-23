@@ -75,6 +75,11 @@ pub fn to_previous_version(raw: &str, version: &Version) -> Result<Option<String
     if !version.pre.is_empty() {
         return Err("saved-config compatibility requires a stable release version");
     }
+    // Older releases ignore unknown resource fields; dropping PCI passthrough would silently
+    // launch a sandbox without the requested host device.
+    if requires_downgrade(version) && has_pci_devices(raw) {
+        return Err("PCI passthrough requires v0.8.0 or later");
+    }
     match (version.major, version.minor, version.patch) {
         (0, 6, patch) => to_v0_6(raw, patch),
         (0, 7, 0..=2) => compat::v0_7_0::secrets::to_previous_version(raw),
@@ -95,6 +100,18 @@ pub fn requires_downgrade(version: &Version) -> bool {
 /// Whether compatibility preparation for this destination can rewrite saved records.
 pub fn requires_rewrite(version: &Version) -> bool {
     matches!((version.major, version.minor), (0, 6))
+}
+
+fn has_pci_devices(raw: &str) -> bool {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/resources/pci_devices")
+                .and_then(Value::as_array)
+                .map(|devices| !devices.is_empty())
+        })
+        .unwrap_or(false)
 }
 
 // Secret source references arrived in v0.6.4; the policy shape predates v0.6.
@@ -182,6 +199,26 @@ mod tests {
         assert_eq!(previous, value);
         assert!(
             to_previous_version(&encoded, &Version::new(0, 6, 5))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn downgrade_rejects_pci_passthrough_and_keeps_empty_lists_compatible() {
+        let with_pci =
+            serde_json::json!({"resources":{"pci_devices":["0000:04:00.3"]}}).to_string();
+        for version in [Version::new(0, 6, 5), Version::new(0, 7, 6)] {
+            assert!(
+                to_previous_version(&with_pci, &version)
+                    .unwrap_err()
+                    .contains("PCI passthrough")
+            );
+        }
+        let empty = serde_json::json!({"resources":{"pci_devices":[]}}).to_string();
+        assert!(to_previous_version(&empty, &Version::new(0, 7, 6)).is_ok());
+        assert!(
+            to_previous_version(&with_pci, &Version::new(0, 8, 0))
                 .unwrap()
                 .is_none()
         );

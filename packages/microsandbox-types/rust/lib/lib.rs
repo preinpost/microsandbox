@@ -96,6 +96,6 @@ pub use snapshot::{
     ExternalMountRestorePolicy, ExternalMountWarning,
 };
 pub use validation::{
-    MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, hostname_from_sandbox_name, validate_hostname,
-    validate_sandbox_name,
+    MAX_HOSTNAME_BYTES, MAX_SANDBOX_NAME_BYTES, hostname_from_sandbox_name, normalize_pci_bdf,
+    normalize_pci_devices, validate_hostname, validate_sandbox_name,
 };

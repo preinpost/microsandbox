@@ -287,6 +287,13 @@ impl LaunchContract {
         if launch.nested_virt == Some(true) {
             validate_nested_host(capabilities(path).await?.as_ref())?;
         }
+        // Older decoders reject the unknown `pci_devices` field, so send it only after the
+        // runtime advertises passthrough support.
+        if !launch.pci_devices.is_empty() && !capabilities(path).await?.pci_passthrough {
+            return Err(MicrosandboxError::Runtime(upgrade_required(
+                "PCI passthrough",
+            )));
+        }
 
         if self.machine && launch.nested_virt != Some(true) {
             let capabilities = capabilities(path).await?;
@@ -308,6 +315,9 @@ impl LaunchContract {
     }
 
     fn to_previous_version(self, launch: &LaunchConfig) -> MicrosandboxResult<Value> {
+        if !launch.pci_devices.is_empty() {
+            return unsupported("PCI passthrough");
+        }
         if launch.nested_virt == Some(true)
             || (launch.nested_virt == Some(false)
                 && cfg!(all(target_os = "linux", target_arch = "x86_64")))
@@ -539,6 +549,7 @@ impl LaunchContract {
             placement_profile_name: resources.placement_profile.clone(),
             thp: resources.thp,
             nested_virt: resources.nested_virt,
+            pci_devices: resources.pci_devices.clone(),
             guest_clock: config.spec.runtime.guest_clock.unwrap_or_default(),
             vsock: config.spec.vsock.routes.clone(),
             owned_volumes: config
@@ -673,7 +684,9 @@ pub(crate) async fn validate_runtime_config(
         Ok(runtime) => runtime,
         #[cfg(feature = "embed-binaries")]
         Err(MicrosandboxError::RuntimeNotInstalled(_))
-            if config.spec.resources.nested_virt == Some(true) || needs_guard =>
+            if config.spec.resources.nested_virt == Some(true)
+                || needs_guard
+                || !config.spec.resources.pci_devices.is_empty() =>
         {
             // Keep first-use installation working, but discover host support
             // before replacement can remove the existing sandbox.
@@ -687,7 +700,9 @@ pub(crate) async fn validate_runtime_config(
             .await?
         }
         Err(MicrosandboxError::RuntimeNotInstalled(_))
-            if config.spec.resources.nested_virt != Some(true) && !needs_guard =>
+            if config.spec.resources.nested_virt != Some(true)
+                && !needs_guard
+                && config.spec.resources.pci_devices.is_empty() =>
         {
             return Ok(());
         }
@@ -712,6 +727,7 @@ pub(crate) async fn validate_runtime_config(
     }
     let contract = resolve(&runtime.msb_path).await?;
     validate_nested_virt(&runtime.msb_path, config, contract).await?;
+    validate_pci_devices(&runtime.msb_path, &config.spec.resources).await?;
     contract.validate_launch_intent(config)?;
     #[cfg(feature = "net")]
     validate_http_deny_response(&runtime.msb_path, config).await?;
@@ -878,6 +894,31 @@ pub(crate) async fn validate_nested_virt(
     Err(MicrosandboxError::Runtime(upgrade_required(
         "nested virtualization policy",
     )))
+}
+
+/// Refuse PCI passthrough on runtimes without VFIO support, and reject boot layouts whose
+/// hotplug memory would conflict with VFIO's static guest-RAM DMA mappings.
+pub(crate) async fn validate_pci_devices(
+    path: &Path,
+    resources: &microsandbox_types::SandboxResources,
+) -> MicrosandboxResult<()> {
+    if resources.pci_devices.is_empty() {
+        return Ok(());
+    }
+    microsandbox_types::normalize_pci_devices(&resources.pci_devices)
+        .map_err(MicrosandboxError::InvalidConfig)?;
+    if resources.max_memory_mib > resources.memory_mib {
+        return Err(MicrosandboxError::InvalidConfig(
+            "PCI passthrough cannot be combined with memory hotplug; set max_memory equal to memory"
+                .into(),
+        ));
+    }
+    if !capabilities(path).await?.pci_passthrough {
+        return Err(MicrosandboxError::Runtime(upgrade_required(
+            "PCI passthrough",
+        )));
+    }
+    Ok(())
 }
 
 fn validate_nested_host(capabilities: &LaunchCapabilities) -> MicrosandboxResult<()> {
@@ -1703,6 +1744,48 @@ mod tests {
         config.http_defaults_implicit = Some(true);
         config.spec.network.http.network_deny_message = Some("explicit message".into());
         assert!(select_http_deny_response(&old, &config).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pci_passthrough_requires_capability_hotplug_free_memory_and_valid_addresses() {
+        let _fixture_guard = PROBE_FIXTURES.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = script(
+            dir.path(),
+            "pci-legacy",
+            r#"printf '%s' '{"protocols":[2,1]}'"#,
+        );
+        let modern = script(
+            dir.path(),
+            "pci-modern",
+            r#"printf '%s' '{"protocols":[2,1],"pci_passthrough":true}'"#,
+        );
+        let mut config =
+            crate::test_support::fixtures::decode(include_str!("../db/fixtures/config-0.6.0.json"))
+                .unwrap();
+        let resources = &mut config.spec.resources;
+        resources.max_memory_mib = resources.memory_mib;
+        resources.pci_devices = vec!["0000:04:00.3".into()];
+        assert!(validate_pci_devices(&legacy, resources).await.is_err());
+        validate_pci_devices(&modern, resources).await.unwrap();
+
+        resources.pci_devices = vec!["0000:04:00.3".into(), "0000:04:00.3".into()];
+        assert!(validate_pci_devices(&modern, resources).await.is_err());
+        resources.pci_devices = vec!["invalid".into()];
+        assert!(validate_pci_devices(&modern, resources).await.is_err());
+
+        resources.pci_devices = vec!["0000:04:00.3".into()];
+        resources.max_memory_mib = resources.memory_mib + 1024;
+        let error = validate_pci_devices(&modern, resources).await.unwrap_err();
+        assert!(error.to_string().contains("memory hotplug"), "{error}");
+
+        // Empty lists never probe the runtime, so ordinary launches keep their old behavior.
+        resources.max_memory_mib = resources.memory_mib;
+        resources.pci_devices.clear();
+        validate_pci_devices(Path::new("/nonexistent/msb"), resources)
+            .await
+            .unwrap();
     }
 
     #[cfg(unix)]

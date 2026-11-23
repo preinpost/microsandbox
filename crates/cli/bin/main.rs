@@ -433,6 +433,7 @@ fn main() {
                     ),
                     exec_limits: true,
                     multi_tenant: cfg!(feature = "net"),
+                    pci_passthrough: cfg!(all(target_os = "linux", target_arch = "x86_64")),
                 })
                 .expect("serialize capabilities");
             capabilities["deferred_command_bindings"] = true.into();

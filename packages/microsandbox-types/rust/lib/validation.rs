@@ -67,6 +67,47 @@ pub fn validate_hostname(hostname: Option<&str>) -> TypesResult<()> {
     Ok(())
 }
 
+/// Parse a PCI device address `DDDD:BB:DD.F` (hex digits, case-insensitive) and return the
+/// canonical lowercase form. Device numbers are 0..=31 and function numbers 0..=7.
+pub fn normalize_pci_bdf(value: &str) -> Result<String, String> {
+    let invalid =
+        || format!("invalid PCI address `{value}`: expected DDDD:BB:DD.F, e.g. 0000:04:00.3");
+    let bytes = value.as_bytes();
+    if bytes.len() != 12 || bytes[4] != b':' || bytes[7] != b':' || bytes[10] != b'.' {
+        return Err(invalid());
+    }
+    let hex = |range: std::ops::Range<usize>| -> Option<u32> {
+        let part = value.get(range)?;
+        if part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            u32::from_str_radix(part, 16).ok()
+        } else {
+            None
+        }
+    };
+    let (Some(_domain), Some(_bus), Some(device), Some(function)) =
+        (hex(0..4), hex(5..7), hex(8..10), hex(11..12))
+    else {
+        return Err(invalid());
+    };
+    if device > 0x1f || function > 0x7 {
+        return Err(invalid());
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+/// Normalize a list of PCI addresses, rejecting duplicates after canonicalization.
+pub fn normalize_pci_devices<S: AsRef<str>>(values: &[S]) -> Result<Vec<String>, String> {
+    let mut normalized: Vec<String> = Vec::with_capacity(values.len());
+    for value in values {
+        let bdf = normalize_pci_bdf(value.as_ref())?;
+        if normalized.contains(&bdf) {
+            return Err(format!("duplicate PCI device `{bdf}`"));
+        }
+        normalized.push(bdf);
+    }
+    Ok(normalized)
+}
+
 /// Derive a guest hostname from a sandbox name while fitting within [`MAX_HOSTNAME_BYTES`].
 pub fn hostname_from_sandbox_name(name: &str) -> String {
     if name.len() <= MAX_HOSTNAME_BYTES {
@@ -241,6 +282,43 @@ mod tests {
                 .unwrap_err()
                 .to_string(),
             "invalid config: hostname is too long: 65 bytes (max 64)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pci_bdf_tests {
+    use super::{normalize_pci_bdf, normalize_pci_devices};
+
+    #[test]
+    fn accepts_and_lowercases_canonical_addresses() {
+        assert_eq!(normalize_pci_bdf("0000:04:00.3").unwrap(), "0000:04:00.3");
+        assert_eq!(normalize_pci_bdf("0000:0A:1F.7").unwrap(), "0000:0a:1f.7");
+    }
+
+    #[test]
+    fn rejects_malformed_or_out_of_range_addresses() {
+        for bad in [
+            "",
+            "invalid",
+            "0000:04:00",
+            "0000:04:00.8",
+            "0000:04:20.0",
+            "000:04:00.0",
+            "0000-04-00.3",
+            "0000:0g:00.0",
+            "éééé:04:00.0",
+        ] {
+            assert!(normalize_pci_bdf(bad).is_err(), "{bad} should be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_duplicates_after_normalization() {
+        assert!(normalize_pci_devices(&["0000:0a:00.0", "0000:0A:00.0"]).is_err());
+        assert_eq!(
+            normalize_pci_devices(&["0000:02:00.0", "0000:04:00.3"]).unwrap(),
+            ["0000:02:00.0", "0000:04:00.3"]
         );
     }
 }

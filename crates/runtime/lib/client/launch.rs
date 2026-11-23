@@ -123,6 +123,11 @@ pub struct LaunchCapabilities {
     #[serde(default)]
     pub exec_limits: bool,
 
+    /// The launch field `pci_devices` (VFIO passthrough) is honored by the runtime.
+    /// Only Linux x86_64 hosts advertise it; older runtimes omit it.
+    #[serde(default)]
+    pub pci_passthrough: bool,
+
     /// The launch field `multi_tenant` is honored by the runtime.
     /// Older runtimes omit this capability.
     #[serde(default)]
@@ -222,6 +227,11 @@ pub struct LaunchConfig {
     /// Nested virtualization policy; omitted by older launchers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nested_virt: Option<bool>,
+
+    /// Host PCI devices (`DDDD:BB:DD.F`) to pass through with VFIO. Omitted when empty so
+    /// runtimes that predate the field keep accepting ordinary launches.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pci_devices: Vec<String>,
 
     /// Host control over the guest wall clock. Omitted when it is the default host sync, so
     /// runtimes that predate the field keep accepting ordinary launches.
@@ -717,6 +727,19 @@ mod tests {
         without_files.as_object_mut().unwrap().remove("file_mounts");
         let decoded: LaunchConfig = serde_json::from_value(without_files).unwrap();
         assert!(decoded.file_mounts.is_empty());
+    }
+
+    #[test]
+    fn pci_devices_handoff_is_omitted_when_empty_and_round_trips() {
+        let empty = serde_json::to_value(LaunchConfig::default()).unwrap();
+        assert!(empty.get("pci_devices").is_none());
+        let config = LaunchConfig {
+            pci_devices: vec!["0000:04:00.3".into()],
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(config).unwrap();
+        assert_eq!(encoded["pci_devices"], serde_json::json!(["0000:04:00.3"]));
+        assert_eq!(decode(encoded).unwrap().pci_devices, ["0000:04:00.3"]);
     }
 
     #[test]

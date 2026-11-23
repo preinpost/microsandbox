@@ -179,6 +179,7 @@ impl PreviousLaunch {
             libkrunfw_path: self.libkrunfw_path,
             thp: self.thp,
             nested_virt: None,
+            pci_devices: Vec::new(),
             // Previous launch formats had no clock policy; they always synchronized.
             guest_clock: Default::default(),
             fs_state_limit_bytes: None,

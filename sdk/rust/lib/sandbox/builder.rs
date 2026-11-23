@@ -675,6 +675,41 @@ impl SandboxBuilder {
         self
     }
 
+    /// Pass one host PCI device through to a local sandbox with VFIO.
+    ///
+    /// The address is `DDDD:BB:DD.F` (for example `0000:04:00.3`); hex digits are
+    /// case-insensitive and stored in lowercase. The device must be bound to `vfio-pci`
+    /// (or unbound) and sit in a viable IOMMU group. Passthrough requires a runtime that
+    /// advertises `pci_passthrough` and cannot be combined with memory hotplug. Invalid or
+    /// duplicate addresses are reported by [`build`](Self::build).
+    pub fn pci_device(self, bdf: impl Into<String>) -> Self {
+        self.pci_devices([bdf])
+    }
+
+    /// Pass several host PCI devices through with VFIO. Each call appends to the list;
+    /// see [`pci_device`](Self::pci_device) for address format and requirements.
+    pub fn pci_devices<I, S>(mut self, bdfs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut all = self
+            .config
+            .spec
+            .resources
+            .pci_devices
+            .clone()
+            .unwrap_or_default();
+        all.extend(bdfs.into_iter().map(Into::into));
+        match microsandbox_types::normalize_pci_devices(&all) {
+            Ok(devices) => {
+                self.config.spec.resources.pci_devices = Some(devices);
+                self
+            }
+            Err(message) => self.config_error(message),
+        }
+    }
+
     /// Select the guest transparent huge-page policy applied at boot.
     ///
     /// `Madvise` is the default and uses huge pages only for mappings that

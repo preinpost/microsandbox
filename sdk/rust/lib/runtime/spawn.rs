@@ -349,6 +349,8 @@ impl LocalContext {
 
         launch_contract::validate_nested_virt(&resolved_runtime.msb_path, config, launch_contract)
             .await?;
+        launch_contract::validate_pci_devices(&resolved_runtime.msb_path, &config.spec.resources)
+            .await?;
         if config.checkpoint_restore.as_ref().is_some_and(|restore| {
             restore
                 .external_mounts
@@ -2363,6 +2365,7 @@ fn machine_cli_args(
         libkrunfw_path: libkrunfw_path.to_path_buf(),
         thp: config.spec.resources.thp,
         nested_virt: config.spec.resources.nested_virt,
+        pci_devices: config.spec.resources.pci_devices.clone(),
         guest_clock: config.spec.runtime.guest_clock.unwrap_or_default(),
         fs_state_limit_bytes: local.config().fs_state_limit_override(),
         memory_cache_dir: Some(local.cache_dir().join("memory")),

@@ -1499,6 +1499,7 @@ impl Default for SandboxConfig {
                     placement_profile: None,
                     thp: TransparentHugePagePolicy::Madvise,
                     nested_virt: None,
+                    pci_devices: Vec::new(),
                 },
                 runtime: SandboxRuntimeOptions {
                     log_level: default_log_level(),
@@ -2362,6 +2363,7 @@ mod tests {
                 placement_profile: None,
                 thp: TransparentHugePagePolicy::Madvise,
                 nested_virt: None,
+                pci_devices: Vec::new(),
             },
             runtime: SandboxRuntimeOptions {
                 workdir: Some("/app".into()),

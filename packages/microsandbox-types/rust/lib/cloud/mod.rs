@@ -534,6 +534,8 @@ impl CloudSandboxSpec {
             placement_profile: None,
             thp: TransparentHugePagePolicy::Madvise,
             nested_virt: None,
+            // Host PCI passthrough is local-only and never crosses the cloud wire.
+            pci_devices: Vec::new(),
         };
 
         // Fields not present on `CloudNetworkSpec` are defaulted here, listed

@@ -1067,6 +1067,11 @@ pub struct SandboxResources {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[config_patch(nullable)]
     pub nested_virt: Option<bool>,
+
+    /// Host PCI devices (`DDDD:BB:DD.F`, lowercase canonical) passed through with VFIO.
+    /// Empty means no passthrough; the key is omitted so existing saved JSON is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pci_devices: Vec<String>,
 }
 
 /// Controls how Microsandbox places vCPU threads on host processors.
@@ -1872,6 +1877,7 @@ impl Default for SandboxResources {
             placement_profile: None,
             thp: TransparentHugePagePolicy::Madvise,
             nested_virt: None,
+            pci_devices: Vec::new(),
         }
     }
 }
@@ -1897,6 +1903,8 @@ impl<'de> Deserialize<'de> for SandboxResources {
             thp: TransparentHugePagePolicy,
             #[serde(default)]
             nested_virt: Option<bool>,
+            #[serde(default)]
+            pci_devices: Vec<String>,
         }
 
         let raw = RawResources::deserialize(deserializer)?;
@@ -1912,6 +1920,7 @@ impl<'de> Deserialize<'de> for SandboxResources {
             placement_profile: raw.placement_profile,
             thp: raw.thp,
             nested_virt: raw.nested_virt,
+            pci_devices: raw.pci_devices,
         })
     }
 }
@@ -3623,6 +3632,27 @@ mod tests {
                 "max_memory_mib": 2048
             })
         );
+    }
+
+    #[test]
+    fn pci_devices_omit_empty_list_and_keep_saved_json_compatible() {
+        let inherited = serde_json::to_value(SandboxResources::default()).unwrap();
+        assert!(inherited.get("pci_devices").is_none());
+
+        let legacy: SandboxResources = serde_json::from_str(
+            r#"{"cpus":2,"memory_mib":512,"max_cpus":2,"max_memory_mib":512}"#,
+        )
+        .unwrap();
+        assert!(legacy.pci_devices.is_empty());
+
+        let with_pci = SandboxResources {
+            pci_devices: vec!["0000:04:00.3".into()],
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&with_pci).unwrap();
+        assert_eq!(encoded["pci_devices"], serde_json::json!(["0000:04:00.3"]));
+        let decoded: SandboxResources = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.pci_devices, ["0000:04:00.3"]);
     }
 
     #[test]

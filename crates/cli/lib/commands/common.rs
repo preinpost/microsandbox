@@ -185,6 +185,11 @@ pub struct SandboxOpts {
     #[arg(long, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     pub nested_virt: Option<bool>,
 
+    /// Pass a host PCI device through to the guest with VFIO (`DDDD:BB:DD.F`, repeatable).
+    /// The device must be bound to `vfio-pci` (or unbound) in a viable IOMMU group.
+    #[arg(long = "pci", value_name = "BDF", value_parser = microsandbox_types::normalize_pci_bdf)]
+    pub pci: Vec<String>,
+
     /// Guest wall-clock policy: `sync` (default) keeps the guest clock in step with the
     /// host; `off` leaves it alone after boot, including across full snapshot restores.
     #[arg(long = "guest-clock", value_name = "POLICY", value_parser = guest_clock_parser())]
@@ -1156,6 +1161,7 @@ impl SandboxOpts {
             || self.max_memory.is_some()
             || self.thp.is_some()
             || self.nested_virt.is_some()
+            || !self.pci.is_empty()
             || self.guest_clock.is_some()
             || !self.volume.is_empty()
             || !self.mount_dir.is_empty()
@@ -1445,6 +1451,9 @@ fn apply_sandbox_opts_inner(
     }
     if let Some(enabled) = opts.nested_virt {
         builder = builder.nested_virt(enabled);
+    }
+    for bdf in &opts.pci {
+        builder = builder.pci_device(bdf.clone());
     }
     if let Some(ref thp) = opts.thp {
         let policy = thp
@@ -4546,6 +4555,63 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.spec.resources.thp, TransparentHugePagePolicy::Always);
+    }
+
+    #[tokio::test]
+    async fn pci_flag_parses_repeats_normalizes_and_rejects_bad_addresses() {
+        let parse = |args: &[&str]| {
+            let matches =
+                SandboxOpts::augment_args(Command::new("create").arg(clap::Arg::new("image")))
+                    .try_get_matches_from(args)
+                    .map_err(|error| error.to_string())?;
+            SandboxOpts::from_arg_matches(&matches).map_err(|error| error.to_string())
+        };
+
+        let opts = parse(&[
+            "create",
+            "--pci",
+            "0000:02:00.0",
+            "--pci",
+            "0000:0A:00.3",
+            "alpine",
+        ])
+        .unwrap();
+        assert_eq!(opts.pci, ["0000:02:00.0", "0000:0a:00.3"]);
+        assert!(opts.has_creation_flags());
+
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            config.spec.resources.pci_devices,
+            ["0000:02:00.0", "0000:0a:00.3"]
+        );
+
+        for invalid in ["invalid", "0000:04:00.8", "0000:04:20.0", "0000-04-00.3"] {
+            assert!(
+                parse(&["create", "--pci", invalid, "alpine"]).is_err(),
+                "{invalid} should be rejected"
+            );
+        }
+
+        let duplicate = parse(&[
+            "create",
+            "--pci",
+            "0000:02:00.0",
+            "--pci",
+            "0000:02:00.0",
+            "alpine",
+        ])
+        .unwrap();
+        assert!(
+            apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &duplicate)
+                .unwrap()
+                .build()
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

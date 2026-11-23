@@ -326,6 +326,7 @@ pub fn run(args: MachineArgs) -> ! {
         libkrunfw_path: launch.libkrunfw_path,
         thp: launch.thp,
         nested_virt,
+        pci_devices: launch.pci_devices,
         guest_clock: launch.guest_clock,
         memory_cache_dir: launch.memory_cache_dir,
         vcpus: args.vcpus,
