@@ -190,6 +190,11 @@ pub struct SandboxOpts {
     #[arg(long = "pci", value_name = "BDF", value_parser = microsandbox_types::normalize_pci_bdf)]
     pub pci: Vec<String>,
 
+    /// Expose a virtio-iommu device to the guest so VFIO devices can be isolated by IOMMU
+    /// groups. Requires at least one `--pci` device.
+    #[arg(long = "iommu", action = clap::ArgAction::SetTrue)]
+    pub iommu: bool,
+
     /// Guest wall-clock policy: `sync` (default) keeps the guest clock in step with the
     /// host; `off` leaves it alone after boot, including across full snapshot restores.
     #[arg(long = "guest-clock", value_name = "POLICY", value_parser = guest_clock_parser())]
@@ -1162,6 +1167,7 @@ impl SandboxOpts {
             || self.thp.is_some()
             || self.nested_virt.is_some()
             || !self.pci.is_empty()
+            || self.iommu
             || self.guest_clock.is_some()
             || !self.volume.is_empty()
             || !self.mount_dir.is_empty()
@@ -1454,6 +1460,9 @@ fn apply_sandbox_opts_inner(
     }
     for bdf in &opts.pci {
         builder = builder.pci_device(bdf.clone());
+    }
+    if opts.iommu {
+        builder = builder.virtio_iommu(true);
     }
     if let Some(ref thp) = opts.thp {
         let policy = thp
@@ -4555,6 +4564,36 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.spec.resources.thp, TransparentHugePagePolicy::Always);
+    }
+
+    #[tokio::test]
+    async fn iommu_flag_is_a_bare_switch_alongside_pci_devices() {
+        let parse = |args: &[&str]| {
+            let matches =
+                SandboxOpts::augment_args(Command::new("create").arg(clap::Arg::new("image")))
+                    .try_get_matches_from(args)
+                    .map_err(|error| error.to_string())?;
+            SandboxOpts::from_arg_matches(&matches).map_err(|error| error.to_string())
+        };
+
+        let opts = parse(&["create", "--pci", "0000:04:00.3", "--iommu", "alpine"]).unwrap();
+        assert!(opts.iommu);
+        assert_eq!(opts.pci, ["0000:04:00.3"]);
+        assert!(opts.has_creation_flags());
+        let config = apply_sandbox_opts(SandboxBuilder::new("test").image("alpine"), &opts)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(config.spec.resources.virtio_iommu, Some(true));
+        assert_eq!(config.spec.resources.pci_devices, ["0000:04:00.3"]);
+
+        // The switch never consumes the following positional image name.
+        let opts = parse(&["create", "--iommu", "alpine"]).unwrap();
+        assert!(opts.iommu);
+        assert!(opts.pci.is_empty());
+        assert!(!parse(&["create", "alpine"]).unwrap().iommu);
+        assert!(parse(&["create", "--iommu=true", "alpine"]).is_err());
     }
 
     #[tokio::test]

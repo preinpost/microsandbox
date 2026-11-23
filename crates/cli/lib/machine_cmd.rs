@@ -222,6 +222,11 @@ pub fn run(args: MachineArgs) -> ! {
                 std::process::exit(2);
             });
     let nested_virt = launch.resolve_nested_virt();
+    let virtio_iommu = launch.resolve_virtio_iommu();
+    if let Err(err) = launch.validate_virtio_iommu() {
+        eprintln!("{err}");
+        std::process::exit(2);
+    }
     let is_vmdk = launch.rootfs.disk_format.as_deref() == Some("vmdk");
     let disks = match parse_disk_args(&launch.disks) {
         Ok(disks) => disks,
@@ -327,6 +332,7 @@ pub fn run(args: MachineArgs) -> ! {
         thp: launch.thp,
         nested_virt,
         pci_devices: launch.pci_devices,
+        virtio_iommu,
         guest_clock: launch.guest_clock,
         memory_cache_dir: launch.memory_cache_dir,
         vcpus: args.vcpus,

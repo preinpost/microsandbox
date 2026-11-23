@@ -420,6 +420,23 @@ async fn publish_with_name_retry_admitted(
     }
 }
 
+/// VFIO-mapped device state cannot be captured or restored, so passthrough sandboxes are refused
+/// before any staging or lifecycle work starts. Reads the raw persisted JSON so that legacy
+/// records without the field stay capturable.
+fn require_no_pci_passthrough(name: &str, persisted_config: &str) -> MicrosandboxResult<()> {
+    let config: serde_json::Value = serde_json::from_str(persisted_config)?;
+    let has_pci = config
+        .pointer("/spec/resources/pci_devices")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|devices| !devices.is_empty());
+    if has_pci {
+        return Err(MicrosandboxError::InvalidConfig(format!(
+            "PCI passthrough sandboxes do not support snapshots (sandbox '{name}')"
+        )));
+    }
+    Ok(())
+}
+
 /// Build a complete artifact in operation-owned staging; group publication happens afterward.
 async fn capture_installed(
     local: &LocalContext,
@@ -464,6 +481,7 @@ async fn capture_installed(
             "source sandbox changed before snapshot capture".into(),
         ));
     }
+    require_no_pci_passthrough(&model.name, &model.config)?;
     if full {
         return create_full_snapshot(
             local,
@@ -837,6 +855,7 @@ pub(super) async fn create_snapshot_archive(
             "source sandbox changed before snapshot capture".into(),
         ));
     }
+    require_no_pci_passthrough(&model.name, &model.config)?;
     if full {
         let capture_started = Instant::now();
         let mut captured = capture_full_snapshot(
@@ -2796,6 +2815,24 @@ mod tests {
         assert!(message.contains("checkpoint digest mismatch"));
         assert!(message.contains("thaw timed out; re-pause failed"));
         assert!(!message.contains("saved at"));
+    }
+
+    #[test]
+    fn snapshot_capture_refuses_pci_passthrough_sandboxes() {
+        let with_pci = serde_json::json!({"spec":{"resources":{"pci_devices":["0000:04:00.3"]}}});
+        let error = require_no_pci_passthrough("gpu", &with_pci.to_string()).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("PCI passthrough sandboxes do not support snapshots"),
+            "{error}"
+        );
+        for plain in [
+            serde_json::json!({"spec":{"resources":{"pci_devices":[]}}}),
+            serde_json::json!({"spec":{"resources":{"cpus":1}}}),
+        ] {
+            require_no_pci_passthrough("plain", &plain.to_string()).unwrap();
+        }
     }
 
     /// A real, verifiable checkpoint closure without a VMM or guest process.

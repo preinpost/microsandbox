@@ -21,6 +21,7 @@ async fn executor(root: &Path, socket: &Path) -> Arc<RuntimeControlExecutor> {
         thp: Default::default(),
         nested_virt: Default::default(),
         pci_devices: Vec::new(),
+        virtio_iommu: false,
         guest_clock: Default::default(),
         memory_cache_dir: None,
         vcpus: 1,

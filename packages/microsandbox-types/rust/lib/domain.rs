@@ -1068,6 +1068,12 @@ pub struct SandboxResources {
     #[config_patch(nullable)]
     pub nested_virt: Option<bool>,
 
+    /// Expose a virtio-iommu device to the guest (ACPI VIOT). Requires at least one
+    /// `pci_devices` entry; omission keeps the default and existing saved JSON unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[config_patch(nullable)]
+    pub virtio_iommu: Option<bool>,
+
     /// Host PCI devices (`DDDD:BB:DD.F`, lowercase canonical) passed through with VFIO.
     /// Empty means no passthrough; the key is omitted so existing saved JSON is unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1877,6 +1883,7 @@ impl Default for SandboxResources {
             placement_profile: None,
             thp: TransparentHugePagePolicy::Madvise,
             nested_virt: None,
+            virtio_iommu: None,
             pci_devices: Vec::new(),
         }
     }
@@ -1904,6 +1911,8 @@ impl<'de> Deserialize<'de> for SandboxResources {
             #[serde(default)]
             nested_virt: Option<bool>,
             #[serde(default)]
+            virtio_iommu: Option<bool>,
+            #[serde(default)]
             pci_devices: Vec<String>,
         }
 
@@ -1920,6 +1929,7 @@ impl<'de> Deserialize<'de> for SandboxResources {
             placement_profile: raw.placement_profile,
             thp: raw.thp,
             nested_virt: raw.nested_virt,
+            virtio_iommu: raw.virtio_iommu,
             pci_devices: raw.pci_devices,
         })
     }
@@ -3632,6 +3642,28 @@ mod tests {
                 "max_memory_mib": 2048
             })
         );
+    }
+
+    #[test]
+    fn virtio_iommu_omits_unset_and_roundtrips_explicit_values() {
+        let inherited = serde_json::to_value(SandboxResources::default()).unwrap();
+        assert!(inherited.get("virtio_iommu").is_none());
+        let legacy: SandboxResources = serde_json::from_str(
+            r#"{"cpus":2,"memory_mib":512,"max_cpus":2,"max_memory_mib":512,"pci_devices":["0000:04:00.3"]}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.virtio_iommu, None);
+        for enabled in [false, true] {
+            let resources = SandboxResources {
+                virtio_iommu: Some(enabled),
+                pci_devices: vec!["0000:04:00.3".into()],
+                ..Default::default()
+            };
+            let encoded = serde_json::to_value(&resources).unwrap();
+            assert_eq!(encoded["virtio_iommu"], enabled);
+            let decoded: SandboxResources = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded.virtio_iommu, Some(enabled));
+        }
     }
 
     #[test]

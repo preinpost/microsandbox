@@ -58,6 +58,7 @@ impl RuntimeCaptureSource<'_> {
             // Full restores enforce captured virtualization requirements through restore resources.
             nested_virt: _,
             // Host device attachments are not part of the captured resource policy.
+            virtio_iommu: _,
             pci_devices: _,
             thp,
         } = &self.config.spec.resources;

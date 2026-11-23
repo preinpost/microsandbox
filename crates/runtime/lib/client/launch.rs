@@ -128,6 +128,11 @@ pub struct LaunchCapabilities {
     #[serde(default)]
     pub pci_passthrough: bool,
 
+    /// The launch field `virtio_iommu` (virtio-iommu device with ACPI VIOT) is honored by the
+    /// runtime. Only Linux x86_64 hosts advertise it; older runtimes omit it.
+    #[serde(default)]
+    pub virtio_iommu: bool,
+
     /// The launch field `multi_tenant` is honored by the runtime.
     /// Older runtimes omit this capability.
     #[serde(default)]
@@ -232,6 +237,11 @@ pub struct LaunchConfig {
     /// runtimes that predate the field keep accepting ordinary launches.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pci_devices: Vec<String>,
+
+    /// Expose a virtio-iommu device to the guest. Omitted when unset so runtimes that predate
+    /// the field keep accepting ordinary launches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtio_iommu: Option<bool>,
 
     /// Host control over the guest wall clock. Omitted when it is the default host sync, so
     /// runtimes that predate the field keep accepting ordinary launches.
@@ -495,6 +505,19 @@ impl LaunchConfig {
         self.nested_virt.unwrap_or(false)
     }
 
+    /// Resolve the effective virtio-iommu policy. Omission keeps the device absent.
+    pub fn resolve_virtio_iommu(&self) -> bool {
+        self.virtio_iommu.unwrap_or(false)
+    }
+
+    /// virtio-iommu only describes VFIO devices in the VIOT table, so it is meaningless alone.
+    pub fn validate_virtio_iommu(&self) -> Result<(), String> {
+        microsandbox_types::validate_virtio_iommu_request(
+            self.resolve_virtio_iommu(),
+            &self.pci_devices,
+        )
+    }
+
     /// Decode and validate execution intent before allocating or starting a VM.
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         let config: Self = serde_json::from_slice(bytes)
@@ -740,6 +763,32 @@ mod tests {
         let encoded = serde_json::to_value(config).unwrap();
         assert_eq!(encoded["pci_devices"], serde_json::json!(["0000:04:00.3"]));
         assert_eq!(decode(encoded).unwrap().pci_devices, ["0000:04:00.3"]);
+    }
+
+    #[test]
+    fn virtio_iommu_handoff_is_omitted_when_unset_and_requires_pci() {
+        let unset = serde_json::to_value(LaunchConfig::default()).unwrap();
+        assert!(unset.get("virtio_iommu").is_none());
+        let config = LaunchConfig {
+            virtio_iommu: Some(true),
+            pci_devices: vec!["0000:04:00.3".into()],
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert_eq!(encoded["virtio_iommu"], true);
+        let decoded = decode(encoded).unwrap();
+        assert!(decoded.resolve_virtio_iommu());
+        decoded.validate_virtio_iommu().unwrap();
+        let alone = LaunchConfig {
+            virtio_iommu: Some(true),
+            ..Default::default()
+        };
+        let error = alone.validate_virtio_iommu().unwrap_err();
+        assert!(
+            error.contains("virtio-iommu requires at least one --pci device"),
+            "{error}"
+        );
+        assert!(LaunchConfig::default().validate_virtio_iommu().is_ok());
     }
 
     #[test]

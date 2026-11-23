@@ -303,6 +303,9 @@ pub struct VmConfig {
     /// Host PCI devices (`DDDD:BB:DD.F`) passed through with VFIO. Empty disables passthrough.
     pub pci_devices: Vec<String>,
 
+    /// Expose a virtio-iommu device (ACPI VIOT) to the guest. Requires `pci_devices`.
+    pub virtio_iommu: bool,
+
     /// Host control over the guest wall clock during boot, restore, and resume.
     pub guest_clock: microsandbox_types::GuestClockPolicy,
 
@@ -519,6 +522,12 @@ struct TrampolineRootfsGuard {
 impl VmConfig {
     /// VFIO maps guest RAM statically at boot, so passthrough cannot share a virtio-mem hotplug
     /// region. Reject an explicit hotplug maximum here instead of letting `libkrun` fail later.
+    /// virtio-iommu is only meaningful for VFIO devices, so it needs at least one `pci_devices`.
+    pub fn validate_virtio_iommu(&self) -> RuntimeResult<()> {
+        microsandbox_types::validate_virtio_iommu_request(self.virtio_iommu, &self.pci_devices)
+            .map_err(RuntimeError::Custom)
+    }
+
     pub fn validate_pci_devices(&self) -> RuntimeResult<()> {
         if self.pci_devices.is_empty() {
             return Ok(());
@@ -2077,6 +2086,7 @@ fn build_vm(
     let vm = &config.vm;
     vm.validate_custom_backends()?;
     vm.validate_pci_devices()?;
+    vm.validate_virtio_iommu()?;
     let mut device_bindings = crate::checkpoint::CheckpointDeviceBindings::default();
     // Collects the runtime-owned bootstrap rootfs directories created for
     // unix block-root sandboxes; the caller reclaims them if this VM is
@@ -2177,6 +2187,9 @@ fn build_vm(
     // path never creates a virtio-mem device that would conflict with VFIO DMA mappings.
     for bdf in &vm.pci_devices {
         builder = builder.pci_vfio(bdf.clone());
+    }
+    if vm.virtio_iommu {
+        builder = builder.virtio_iommu(true);
     }
 
     // Root filesystem.
@@ -4596,6 +4609,25 @@ mod tests {
     }
 
     #[test]
+    fn virtio_iommu_requires_pci_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut vm = build_vm_test_config(dir.path(), |_| {}).vm;
+        vm.validate_virtio_iommu().unwrap();
+        vm.virtio_iommu = true;
+        let error = vm.validate_virtio_iommu().unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("virtio-iommu requires at least one --pci device"),
+            "{error}"
+        );
+        vm.pci_devices = vec!["0000:04:00.3".into()];
+        vm.validate_virtio_iommu().unwrap();
+        vm.validate_pci_devices().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn remove_trampoline_rootfs_dirs_tolerates_missing_directories() {
         let host = tempfile::tempdir().unwrap();
         let rootfs_dir = host.path().join("bootstrap-rootfs");
@@ -4635,6 +4667,7 @@ mod tests {
             thp: Default::default(),
             nested_virt: false,
             pci_devices: Vec::new(),
+            virtio_iommu: false,
             guest_clock: Default::default(),
             memory_cache_dir: None,
             vcpus: 1,

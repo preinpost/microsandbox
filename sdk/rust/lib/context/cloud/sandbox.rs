@@ -902,6 +902,9 @@ fn reject_dropped_cloud_create_fields(config: &SandboxConfig) -> MicrosandboxRes
     if !config.spec.resources.pci_devices.is_empty() {
         return Err(unsupported("pci_devices (local-only)"));
     }
+    if config.spec.resources.virtio_iommu == Some(true) {
+        return Err(unsupported("virtio_iommu (local-only)"));
+    }
     if config.spec.resources.max_cpus != config.spec.resources.cpus {
         return Err(unsupported("max_cpus"));
     }
@@ -2580,7 +2583,7 @@ mod tests {
 
     #[test]
     fn cloud_create_request_rejects_fields_missing_from_the_wire() {
-        let cases: [(&str, ConfigMutation); 14] = [
+        let cases: [(&str, ConfigMutation); 15] = [
             ("max_cpus", |config| config.spec.resources.max_cpus = 2),
             ("max_memory", |config| {
                 config.spec.resources.max_memory_mib = 1024
@@ -2593,6 +2596,9 @@ mod tests {
             }),
             ("pci_devices (local-only)", |config| {
                 config.spec.resources.pci_devices = vec!["0000:04:00.3".into()]
+            }),
+            ("virtio_iommu (local-only)", |config| {
+                config.spec.resources.virtio_iommu = Some(true)
             }),
             ("guest_clock", |config| {
                 config.spec.runtime.guest_clock = Some(microsandbox_types::GuestClockPolicy::Off)

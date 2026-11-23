@@ -675,6 +675,16 @@ impl SandboxBuilder {
         self
     }
 
+    /// Expose a virtio-iommu device (ACPI VIOT) to a local sandbox so passed-through PCI
+    /// devices can be isolated by their IOMMU groups.
+    ///
+    /// Requires at least one [`pci_device`](Self::pci_device); creation without one is
+    /// rejected. Passthrough requires a runtime that advertises `virtio_iommu`.
+    pub fn virtio_iommu(mut self, enabled: bool) -> Self {
+        self.config.spec.resources.virtio_iommu = Some(Some(enabled));
+        self
+    }
+
     /// Pass one host PCI device through to a local sandbox with VFIO.
     ///
     /// The address is `DDDD:BB:DD.F` (for example `0000:04:00.3`); hex digits are

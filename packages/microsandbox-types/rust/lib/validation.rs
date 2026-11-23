@@ -108,6 +108,18 @@ pub fn normalize_pci_devices<S: AsRef<str>>(values: &[S]) -> Result<Vec<String>,
     Ok(normalized)
 }
 
+/// virtio-iommu is advertised to the guest through the VIOT table, which libkrun only builds
+/// for VFIO devices. Reject the flag alone so the request cannot silently do nothing.
+pub fn validate_virtio_iommu_request<S: AsRef<str>>(
+    enabled: bool,
+    pci_devices: &[S],
+) -> Result<(), String> {
+    if enabled && pci_devices.is_empty() {
+        return Err("virtio-iommu requires at least one --pci device".into());
+    }
+    Ok(())
+}
+
 /// Derive a guest hostname from a sandbox name while fitting within [`MAX_HOSTNAME_BYTES`].
 pub fn hostname_from_sandbox_name(name: &str) -> String {
     if name.len() <= MAX_HOSTNAME_BYTES {

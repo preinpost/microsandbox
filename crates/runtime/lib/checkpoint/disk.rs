@@ -1965,6 +1965,7 @@ mod tests {
             thp: Default::default(),
             nested_virt: false,
             pci_devices: Vec::new(),
+            virtio_iommu: false,
             guest_clock: Default::default(),
             memory_cache_dir: None,
             vcpus: 1,

@@ -80,6 +80,10 @@ pub fn to_previous_version(raw: &str, version: &Version) -> Result<Option<String
     if requires_downgrade(version) && has_pci_devices(raw) {
         return Err("PCI passthrough requires v0.8.0 or later");
     }
+    // An older release would silently ignore the virtio-iommu device the sandbox asked for.
+    if requires_downgrade(version) && has_virtio_iommu(raw) {
+        return Err("virtio-iommu requires v0.8.0 or later");
+    }
     match (version.major, version.minor, version.patch) {
         (0, 6, patch) => to_v0_6(raw, patch),
         (0, 7, 0..=2) => compat::v0_7_0::secrets::to_previous_version(raw),
@@ -100,6 +104,17 @@ pub fn requires_downgrade(version: &Version) -> bool {
 /// Whether compatibility preparation for this destination can rewrite saved records.
 pub fn requires_rewrite(version: &Version) -> bool {
     matches!((version.major, version.minor), (0, 6))
+}
+
+fn has_virtio_iommu(raw: &str) -> bool {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/resources/virtio_iommu")
+                .and_then(Value::as_bool)
+        })
+        .unwrap_or(false)
 }
 
 fn has_pci_devices(raw: &str) -> bool {
@@ -219,6 +234,27 @@ mod tests {
         assert!(to_previous_version(&empty, &Version::new(0, 7, 6)).is_ok());
         assert!(
             to_previous_version(&with_pci, &Version::new(0, 8, 0))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn downgrade_rejects_virtio_iommu_and_allows_unset_or_disabled() {
+        let enabled = serde_json::json!({"resources":{"virtio_iommu":true}}).to_string();
+        for version in [Version::new(0, 6, 5), Version::new(0, 7, 6)] {
+            assert!(
+                to_previous_version(&enabled, &version)
+                    .unwrap_err()
+                    .contains("virtio-iommu")
+            );
+        }
+        let disabled = serde_json::json!({"resources":{"virtio_iommu":false}}).to_string();
+        assert!(to_previous_version(&disabled, &Version::new(0, 7, 6)).is_ok());
+        let unset = serde_json::json!({"resources":{"cpus":1}}).to_string();
+        assert!(to_previous_version(&unset, &Version::new(0, 7, 6)).is_ok());
+        assert!(
+            to_previous_version(&enabled, &Version::new(0, 8, 0))
                 .unwrap()
                 .is_none()
         );

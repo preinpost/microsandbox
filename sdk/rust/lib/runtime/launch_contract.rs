@@ -259,6 +259,13 @@ impl LaunchContract {
                 .expect("launch config object")
                 .remove("nested_virt");
         }
+        // Keep the field off the wire unless it is an explicit enable, as older decoders reject it.
+        if launch.virtio_iommu != Some(true) {
+            value
+                .as_object_mut()
+                .expect("launch config object")
+                .remove("virtio_iommu");
+        }
         #[cfg(feature = "net")]
         let value = {
             let mut value = value;
@@ -294,6 +301,9 @@ impl LaunchContract {
                 "PCI passthrough",
             )));
         }
+        if launch.virtio_iommu == Some(true) && !capabilities(path).await?.virtio_iommu {
+            return Err(MicrosandboxError::Runtime(upgrade_required("virtio-iommu")));
+        }
 
         if self.machine && launch.nested_virt != Some(true) {
             let capabilities = capabilities(path).await?;
@@ -323,6 +333,9 @@ impl LaunchContract {
                 && cfg!(all(target_os = "linux", target_arch = "x86_64")))
         {
             return unsupported("nested virtualization policy");
+        }
+        if launch.virtio_iommu == Some(true) {
+            return unsupported("virtio-iommu");
         }
         if launch.execution != microsandbox_runtime::launch::ExecutionIntent::Boot {
             return unsupported("execution restore");
@@ -358,6 +371,7 @@ impl LaunchContract {
             "checkpoint_restore",
             "memory_cache_dir",
             "nested_virt",
+            "virtio_iommu",
         ] {
             fields.remove(key);
         }
@@ -550,6 +564,7 @@ impl LaunchContract {
             thp: resources.thp,
             nested_virt: resources.nested_virt,
             pci_devices: resources.pci_devices.clone(),
+            virtio_iommu: resources.virtio_iommu,
             guest_clock: config.spec.runtime.guest_clock.unwrap_or_default(),
             vsock: config.spec.vsock.routes.clone(),
             owned_volumes: config
@@ -686,7 +701,8 @@ pub(crate) async fn validate_runtime_config(
         Err(MicrosandboxError::RuntimeNotInstalled(_))
             if config.spec.resources.nested_virt == Some(true)
                 || needs_guard
-                || !config.spec.resources.pci_devices.is_empty() =>
+                || !config.spec.resources.pci_devices.is_empty()
+                || config.spec.resources.virtio_iommu == Some(true) =>
         {
             // Keep first-use installation working, but discover host support
             // before replacement can remove the existing sandbox.
@@ -702,7 +718,8 @@ pub(crate) async fn validate_runtime_config(
         Err(MicrosandboxError::RuntimeNotInstalled(_))
             if config.spec.resources.nested_virt != Some(true)
                 && !needs_guard
-                && config.spec.resources.pci_devices.is_empty() =>
+                && config.spec.resources.pci_devices.is_empty()
+                && config.spec.resources.virtio_iommu != Some(true) =>
         {
             return Ok(());
         }
@@ -728,6 +745,7 @@ pub(crate) async fn validate_runtime_config(
     let contract = resolve(&runtime.msb_path).await?;
     validate_nested_virt(&runtime.msb_path, config, contract).await?;
     validate_pci_devices(&runtime.msb_path, &config.spec.resources).await?;
+    validate_virtio_iommu(&runtime.msb_path, &config.spec.resources).await?;
     contract.validate_launch_intent(config)?;
     #[cfg(feature = "net")]
     validate_http_deny_response(&runtime.msb_path, config).await?;
@@ -917,6 +935,22 @@ pub(crate) async fn validate_pci_devices(
         return Err(MicrosandboxError::Runtime(upgrade_required(
             "PCI passthrough",
         )));
+    }
+    Ok(())
+}
+
+/// Refuse virtio-iommu without a VFIO device or on runtimes that would drop the device.
+pub(crate) async fn validate_virtio_iommu(
+    path: &Path,
+    resources: &microsandbox_types::SandboxResources,
+) -> MicrosandboxResult<()> {
+    if resources.virtio_iommu != Some(true) {
+        return Ok(());
+    }
+    microsandbox_types::validate_virtio_iommu_request(true, &resources.pci_devices)
+        .map_err(MicrosandboxError::InvalidConfig)?;
+    if !capabilities(path).await?.virtio_iommu {
+        return Err(MicrosandboxError::Runtime(upgrade_required("virtio-iommu")));
     }
     Ok(())
 }
@@ -1786,6 +1820,92 @@ mod tests {
         validate_pci_devices(Path::new("/nonexistent/msb"), resources)
             .await
             .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn virtio_iommu_requires_pci_devices_and_a_capable_runtime() {
+        let _fixture_guard = PROBE_FIXTURES.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let pci_only = script(
+            dir.path(),
+            "iommu-pci-only",
+            r#"printf '%s' '{"protocols":[2,1],"pci_passthrough":true}'"#,
+        );
+        let capable = script(
+            dir.path(),
+            "iommu-capable",
+            r#"printf '%s' '{"protocols":[2,1],"pci_passthrough":true,"virtio_iommu":true}'"#,
+        );
+        let mut config =
+            crate::test_support::fixtures::decode(include_str!("../db/fixtures/config-0.6.0.json"))
+                .unwrap();
+        let resources = &mut config.spec.resources;
+        resources.max_memory_mib = resources.memory_mib;
+        resources.virtio_iommu = Some(true);
+
+        // Refused before any runtime probe: without a VFIO device the VIOT table is never built.
+        let error = validate_virtio_iommu(Path::new("/nonexistent/msb"), resources)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("virtio-iommu requires at least one --pci device"),
+            "{error}"
+        );
+
+        resources.pci_devices = vec!["0000:04:00.3".into()];
+        let error = validate_virtio_iommu(&pci_only, resources)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("virtio-iommu"), "{error}");
+        validate_virtio_iommu(&capable, resources).await.unwrap();
+
+        // Unset or explicitly disabled never probes the runtime.
+        resources.virtio_iommu = Some(false);
+        resources.pci_devices.clear();
+        validate_virtio_iommu(Path::new("/nonexistent/msb"), resources)
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn virtio_iommu_wire_field_is_sent_only_when_explicitly_enabled() {
+        let advertised: LaunchCapabilities = serde_json::from_value(json!({
+            "protocols": [2, 1], "header_fields": true,
+        }))
+        .unwrap();
+        let machine =
+            LaunchContract::from_capabilities(&Version::new(0, 8, 0), &advertised).unwrap();
+        let mut launch = LaunchConfig::default();
+        launch.virtio_iommu = Some(false);
+        let value = machine.encode(&launch).unwrap();
+        assert!(value.get("virtio_iommu").is_none());
+        launch.virtio_iommu = None;
+        assert!(
+            machine
+                .encode(&launch)
+                .unwrap()
+                .get("virtio_iommu")
+                .is_none()
+        );
+        launch.virtio_iommu = Some(true);
+        let value = machine.encode(&launch).unwrap();
+        assert_eq!(value["virtio_iommu"], true);
+
+        // Legacy wire formats cannot carry the device, so an enable is refused instead of dropped.
+        let legacy = LaunchContract::from_version(&Version::new(0, 6, 18)).unwrap();
+        let error = legacy.encode(&launch).unwrap_err();
+        assert!(error.to_string().contains("virtio-iommu"), "{error}");
+        launch.virtio_iommu = Some(false);
+        assert!(
+            legacy
+                .encode(&launch)
+                .unwrap()
+                .get("virtio_iommu")
+                .is_none()
+        );
     }
 
     #[cfg(unix)]
