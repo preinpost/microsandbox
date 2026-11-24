@@ -14,7 +14,7 @@ function fixture(options = {}) {
   return {
     calls,
     context: { eventName: 'workflow_dispatch', ref: 'refs/heads/main', sha: workflowSha,
-      repo: { owner: 'example', repo: 'project' }, ...options.context },
+      repo: { owner: 'superradcompany', repo: 'microsandbox' }, ...options.context },
     releaseTag: tag,
     github: { rest: { repos: { getReleaseByTag: async args => {
       calls.push(['release', args.tag]);
@@ -58,6 +58,19 @@ test('PRs and ordinary manual builds never enable publication or inspect tags', 
     const input = fixture({ context });
     input.releaseTag = '';
     assert.deepEqual(await resolveReleaseContext(input), { source_sha: workflowSha, tag: '', publish: 'false' });
+    assert.deepEqual(input.calls, []);
+  }
+});
+
+test('forks never publish, even for version tags or recovery dispatches', async () => {
+  const fork = { owner: 'preinpost', repo: 'microsandbox' };
+  for (const context of [
+    { eventName: 'push', ref: `refs/tags/${tag}`, sha: sourceSha, repo: fork },
+    { eventName: 'workflow_dispatch', ref: 'refs/heads/main', sha: workflowSha, repo: fork },
+  ]) {
+    const input = fixture({ context });
+    input.releaseTag = context.eventName === 'push' ? '' : tag;
+    assert.deepEqual(await resolveReleaseContext(input), { source_sha: context.sha, tag: '', publish: 'false' });
     assert.deepEqual(input.calls, []);
   }
 });

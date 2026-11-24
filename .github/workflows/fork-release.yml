@@ -1,0 +1,707 @@
+name: Fork Release
+
+# Fork-only precompiled release: builds msb + stock libkrunfw per OS/arch and
+# publishes a GitHub Release whose asset names match farm/src/remote/install.sh.
+# It never touches package registries, Homebrew, winget, Docker, or docs.
+#
+# Upstream (superradcompany/microsandbox) never runs this workflow. The plan job
+# is gated on the repository, and scripts/ci/release-context.cjs blocks publication
+# for forks in release.yml.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Create or update the GitHub Release for release_tag (false = build and upload workflow artifacts only)"
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: "Tag to build and publish, e.g. v0.8.1 (required when publish_release is true)"
+        required: false
+        default: ""
+        type: string
+      targets:
+        description: "all, or a comma-separated subset of: linux-x86_64,linux-aarch64,darwin-aarch64,windows-x86_64"
+        required: false
+        default: "all"
+        type: string
+
+concurrency:
+  group: fork-release-${{ inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_TIMEOUT: "120"
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_INCREMENTAL: "0"
+  LIBKRUNFW_VERSION: "5.6.1"
+  LIBKRUNFW_ABI: "5"
+  LINUX_GLIBC_BASELINE: "2.28"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Decide what to build. Matrices contain only the selected targets, so a
+  # matrix job never receives an empty include list.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: Plan
+    if: github.repository != 'superradcompany/microsandbox'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+      publish: ${{ steps.plan.outputs.publish }}
+      source_sha: ${{ steps.plan.outputs.source_sha }}
+      targets: ${{ steps.plan.outputs.targets }}
+      linux_matrix: ${{ steps.plan.outputs.linux_matrix }}
+      firmware_matrix: ${{ steps.plan.outputs.firmware_matrix }}
+      agentd_matrix: ${{ steps.plan.outputs.agentd_matrix }}
+      build_linux: ${{ steps.plan.outputs.build_linux }}
+      build_darwin: ${{ steps.plan.outputs.build_darwin }}
+      build_windows: ${{ steps.plan.outputs.build_windows }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Resolve tag, source commit, and targets
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          GITHUB_SHA_VALUE: ${{ github.sha }}
+          TAG_INPUT: ${{ inputs.release_tag }}
+          PUBLISH_INPUT: ${{ inputs.publish_release }}
+          TARGETS_INPUT: ${{ inputs.targets }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess, sys, tomllib
+
+          ALL = ["linux-x86_64", "linux-aarch64", "darwin-aarch64", "windows-x86_64"]
+          LINUX = {
+              "linux-x86_64": {
+                  "arch": "x86_64",
+                  "runner": "ubuntu-latest",
+                  "image": "quay.io/pypa/manylinux_2_28_x86_64@sha256:0c87ccb5996dab6c3b7612ee4fda7b80c4ab3c44a86c2541e4a872afdf4f131b",
+                  "firmware": "firmware-x86_64",
+                  "agentd": "agentd-x86_64-linux-musl",
+              },
+              "linux-aarch64": {
+                  "arch": "aarch64",
+                  "runner": "ubuntu-24.04-arm",
+                  "image": "quay.io/pypa/manylinux_2_28_aarch64@sha256:561427136aabf3787bffb294b3515748241e0962d1527ae28bea1e076bfb9d99",
+                  "firmware": "firmware-aarch64",
+                  "agentd": "agentd-aarch64-linux-musl",
+              },
+          }
+          # kernel.c generators. The Windows bundle is a separate `make OS=Windows` output.
+          FIRMWARE = {
+              "firmware-x86_64": ("ubuntu-latest", ""),
+              "firmware-aarch64": ("ubuntu-24.04-arm", ""),
+              "firmware-windows-x86_64": ("ubuntu-latest", "OS=Windows kernel.c"),
+          }
+          AGENTD = {
+              "agentd-x86_64-linux-musl": ("ubuntu-latest", "x86_64-unknown-linux-musl"),
+              "agentd-aarch64-linux-musl": ("ubuntu-24.04-arm", "aarch64-unknown-linux-musl"),
+          }
+          NEEDS = {
+              "linux-x86_64": ["firmware-x86_64", "agentd-x86_64-linux-musl"],
+              "linux-aarch64": ["firmware-aarch64", "agentd-aarch64-linux-musl"],
+              "darwin-aarch64": ["firmware-aarch64", "agentd-aarch64-linux-musl"],
+              "windows-x86_64": ["firmware-windows-x86_64", "agentd-x86_64-linux-musl"],
+          }
+
+          def die(message):
+              print(f"::error::{message}", file=sys.stderr)
+              sys.exit(1)
+
+          event = os.environ["EVENT"]
+          requested = os.environ.get("TARGETS_INPUT", "").strip() or "all"
+          if event == "push":
+              tag = os.environ["REF_NAME"]
+              publish = True
+          else:
+              tag = os.environ.get("TAG_INPUT", "").strip()
+              publish = os.environ.get("PUBLISH_INPUT") == "true"
+          if publish and not tag:
+              die("publish_release requires release_tag")
+          if tag and not re.fullmatch(r"v\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", tag):
+              die(f"Expected a version tag such as v0.8.1, got {tag!r}")
+
+          if tag:
+              # Build exactly the tagged commit, whatever branch dispatched the workflow.
+              source = subprocess.check_output(
+                  ["git", "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}"], text=True).strip()
+              manifest = subprocess.check_output(["git", "show", f"{source}:Cargo.toml"], text=True)
+              version = tomllib.loads(manifest)["workspace"]["package"]["version"]
+              if tag != f"v{version}":
+                  die(f"Tag {tag} does not match the workspace version {version}")
+          else:
+              source = os.environ["GITHUB_SHA_VALUE"]
+
+          if requested == "all":
+              selected = list(ALL)
+          else:
+              selected = []
+              for item in (part.strip() for part in requested.split(",")):
+                  if not item:
+                      continue
+                  if item not in ALL:
+                      die(f"Unknown target {item!r}; expected all or a subset of {ALL}")
+                  if item not in selected:
+                      selected.append(item)
+              if not selected:
+                  die("No targets selected")
+          selected = [t for t in ALL if t in selected]
+
+          needed = {artifact for target in selected for artifact in NEEDS[target]}
+          linux_matrix = [{"target": t, **LINUX[t]} for t in selected if t in LINUX]
+          firmware_matrix = [{"artifact": k, "runner": v[0], "make_args": v[1]}
+                             for k, v in FIRMWARE.items() if k in needed]
+          agentd_matrix = [{"artifact": k, "runner": v[0], "triple": v[1]}
+                           for k, v in AGENTD.items() if k in needed]
+
+          def compact(value):
+              return json.dumps(value, separators=(",", ":"))
+
+          outputs = {
+              "tag": tag,
+              "publish": "true" if publish else "false",
+              "source_sha": source,
+              "targets": compact(selected),
+              "linux_matrix": compact(linux_matrix),
+              "firmware_matrix": compact(firmware_matrix),
+              "agentd_matrix": compact(agentd_matrix),
+              "build_linux": "true" if linux_matrix else "false",
+              "build_darwin": "true" if "darwin-aarch64" in selected else "false",
+              "build_windows": "true" if "windows-x86_64" in selected else "false",
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              for key, value in outputs.items():
+                  handle.write(f"{key}={value}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write("## Fork release plan\n\n")
+              for key, value in outputs.items():
+                  handle.write(f"- `{key}`: `{value}`\n")
+          PY
+
+  # Fetch and verify the kernel archive once. Firmware jobs fan it out.
+  kernel-sources:
+    name: Kernel sources
+    needs: plan
+    if: needs.plan.outputs.firmware_matrix != '[]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+
+      - name: Checkout libkrunfw sources
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - name: Prepare kernel source
+        uses: ./.github/actions/cache-libkrunfw-kernel
+
+      - name: Upload kernel source archive
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: kernel-source
+          path: vendor/libkrunfw/tarballs/*.tar.gz
+          compression-level: 0
+
+  # Generate kernel.c per firmware bundle. Linux and macOS relink it themselves.
+  firmware:
+    name: Firmware (${{ matrix.artifact }})
+    needs: [plan, kernel-sources]
+    if: needs.plan.outputs.firmware_matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.firmware_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+
+      - name: Checkout libkrunfw sources
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - name: Cache firmware
+        id: cache-firmware
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: vendor/libkrunfw/kernel.c
+          key: fork-${{ matrix.artifact }}-${{ hashFiles('vendor/libkrunfw/**') }}
+
+      - name: Install firmware build dependencies
+        if: steps.cache-firmware.outputs.cache-hit != 'true'
+        run: bash scripts/ci/install-apt-packages.sh libcap-ng-dev gcc make flex bison libelf-dev bc python3-pyelftools
+
+      - name: Download kernel source archive
+        if: steps.cache-firmware.outputs.cache-hit != 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: kernel-source
+          path: vendor/libkrunfw/tarballs
+
+      - name: Build firmware
+        if: steps.cache-firmware.outputs.cache-hit != 'true'
+        working-directory: vendor/libkrunfw
+        run: make -j$(nproc) ${{ matrix.make_args }}
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: vendor/libkrunfw/kernel.c
+          compression-level: 0
+
+  # Guest daemon, compiled once per guest architecture.
+  agentd:
+    name: Agentd (${{ matrix.triple }})
+    needs: plan
+    if: needs.plan.outputs.agentd_matrix != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.agentd_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.triple }}
+
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: fork-release-${{ matrix.artifact }}
+
+      - name: Install musl toolchain
+        run: bash scripts/ci/install-apt-packages.sh musl-tools
+
+      - name: Build agentd
+        run: cargo build --release --manifest-path crates/agentd/Cargo.toml --target ${{ matrix.triple }}
+
+      - name: Upload agentd
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/${{ matrix.triple }}/release/agentd
+          compression-level: 0
+
+  # ---------------------------------------------------------------------------
+  # Linux: manylinux_2_28 containers, matching release-linux.yml. Each arch
+  # builds on its native runner.
+  # ---------------------------------------------------------------------------
+  build-linux:
+    name: Linux ${{ matrix.arch }}
+    needs: [plan, firmware, agentd]
+    if: needs.plan.outputs.build_linux == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.linux_matrix) }}
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ${{ matrix.image }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: fork-release-${{ matrix.target }}
+
+      - name: Install build dependencies
+        run: dnf install -y libcap-ng-devel
+
+      - name: Download agentd
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.agentd }}
+          path: build/
+
+      - name: Download firmware
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ matrix.firmware }}
+          path: firmware/
+
+      - name: Link libkrunfw against the glibc baseline
+        run: |
+          mkdir -p build
+          cc -fPIC -DABI_VERSION=${{ env.LIBKRUNFW_ABI }} -shared \
+            -Wl,-soname,libkrunfw.so.${{ env.LIBKRUNFW_ABI }} \
+            -o build/libkrunfw.so.${{ env.LIBKRUNFW_VERSION }} firmware/kernel.c
+          strip build/libkrunfw.so.${{ env.LIBKRUNFW_VERSION }}
+          cd build
+          ln -sf libkrunfw.so.${{ env.LIBKRUNFW_VERSION }} libkrunfw.so.${{ env.LIBKRUNFW_ABI }}
+          ln -sf libkrunfw.so.${{ env.LIBKRUNFW_ABI }} libkrunfw.so
+
+      - name: Build msb
+        run: |
+          cargo build --release --no-default-features --features embed-binaries,net,ssh,keyring -p microsandbox-cli
+          cp target/release/msb build/msb
+
+      - name: Verify runtime and glibc baseline
+        run: |
+          build/msb --version
+          python3 scripts/ci/validate_linux_glibc.py \
+            --max-version ${{ env.LINUX_GLIBC_BASELINE }} \
+            build/agentd build/msb build/libkrunfw.so.${{ env.LIBKRUNFW_VERSION }}
+
+      - name: Smoke test installed runtime discovery
+        run: |
+          python3 scripts/smoke/cli/runtime-discovery.py \
+            --msb build/msb --libkrunfw build/libkrunfw.so.${{ env.LIBKRUNFW_VERSION }}
+
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          target='${{ matrix.target }}'
+          mkdir -p dist
+          chmod 755 build/msb
+          # Only the two runtime files go into the bundle; symlinks stay out.
+          tar -czf "dist/microsandbox-${target}.tar.gz" -C build msb libkrunfw.so.${{ env.LIBKRUNFW_VERSION }}
+          cp build/msb "dist/msb-${target}"
+          cp "build/libkrunfw.so.${{ env.LIBKRUNFW_VERSION }}" "dist/libkrunfw-${target}.so"
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          compression-level: 0
+
+  # ---------------------------------------------------------------------------
+  # macOS aarch64: matches release-macos.yml (libkrunfw.5.dylib, ad-hoc signing).
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: macOS aarch64
+    needs: [plan, firmware, agentd]
+    if: needs.plan.outputs.build_darwin == 'true'
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      # Preserve the previous host OS floor when building on macOS 15.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: fork-release-darwin-aarch64
+
+      - name: Download agentd
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agentd-aarch64-linux-musl
+          path: build/
+
+      - name: Download firmware
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: firmware-aarch64
+          path: firmware/
+
+      - name: Build libkrunfw
+        run: |
+          mkdir -p build
+          # Reserve load-command space so the dylib path can be rewritten without relinking.
+          cc -fPIC -DABI_VERSION=${{ env.LIBKRUNFW_ABI }} -shared \
+            -Wl,-headerpad_max_install_names \
+            -o build/libkrunfw.${{ env.LIBKRUNFW_ABI }}.dylib firmware/kernel.c
+
+      - name: Build msb
+        run: |
+          cargo build --release --no-default-features --features embed-binaries,net,ssh,keyring -p microsandbox-cli
+          cp target/release/msb build/msb
+
+      - name: Codesign msb
+        run: codesign --entitlements msb-entitlements.plist --force -s - build/msb
+
+      - name: Verify runtime binary
+        run: build/msb --version
+
+      - name: Smoke test installed runtime discovery
+        run: |
+          python3 scripts/smoke/cli/runtime-discovery.py \
+            --msb build/msb --libkrunfw build/libkrunfw.${{ env.LIBKRUNFW_ABI }}.dylib
+
+      - name: Stage release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          chmod 755 build/msb
+          # COPYFILE_DISABLE stops bsdtar from adding AppleDouble ._ entries to the bundle.
+          COPYFILE_DISABLE=1 tar -czf dist/microsandbox-darwin-aarch64.tar.gz -C build msb libkrunfw.${{ env.LIBKRUNFW_ABI }}.dylib
+          cp build/msb dist/msb-darwin-aarch64
+          cp build/libkrunfw.${{ env.LIBKRUNFW_ABI }}.dylib dist/libkrunfw-darwin-aarch64.dylib
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-darwin-aarch64
+          path: dist/*
+          compression-level: 0
+
+  # ---------------------------------------------------------------------------
+  # Windows x86_64: matches release-windows.yml (libkrunfw.dll, crt-static msb.exe).
+  # ---------------------------------------------------------------------------
+  build-windows:
+    name: Windows x86_64
+    needs: [plan, firmware, agentd]
+    if: needs.plan.outputs.build_windows == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.source_sha }}
+
+      - name: Checkout libkrunfw build helpers
+        run: git submodule update --init --depth 1 vendor/libkrunfw
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
+        with:
+          cache-bin: false
+          cache-targets: true
+          shared-key: fork-release-windows-x86_64
+
+      - name: Download kernel bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: firmware-windows-x86_64
+          path: vendor/libkrunfw/
+
+      - name: Download agentd
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: agentd-x86_64-linux-musl
+          path: build/
+
+      - name: Build libkrunfw.dll
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\vendor\libkrunfw\scripts\build-windows.ps1 `
+            -SkipKernelBundle `
+            -AbiVersion ${{ env.LIBKRUNFW_ABI }} `
+            -Architecture amd64 `
+            -HostArchitecture amd64 `
+            -Output libkrunfw.dll `
+            -ImportLibrary libkrunfw.lib
+          New-Item -ItemType Directory -Force -Path build | Out-Null
+          Copy-Item vendor\libkrunfw\libkrunfw.dll build\libkrunfw.dll -Force
+
+      - name: Build msb
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          $ErrorActionPreference = "Stop"
+          . "$env:GITHUB_WORKSPACE\vendor\libkrunfw\scripts\msvc-env.ps1"
+          Set-MsvcEnvironment -Architecture amd64 -HostArchitecture amd64
+          cargo build --release --no-default-features --features embed-binaries,net,ssh,keyring -p microsandbox-cli --target x86_64-pc-windows-msvc
+          Copy-Item target\x86_64-pc-windows-msvc\release\msb.exe build\msb.exe -Force
+          & build\msb.exe --version
+
+      - name: Smoke test installed runtime discovery
+        run: python scripts/smoke/cli/runtime-discovery.py --msb build/msb.exe --libkrunfw build/libkrunfw.dll
+
+      - name: Stage release assets
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist, stage | Out-Null
+          Copy-Item build\msb.exe stage\msb.exe -Force
+          Copy-Item build\libkrunfw.dll stage\libkrunfw.dll -Force
+          Copy-Item build\msb.exe dist\msb-windows-x86_64.exe -Force
+          Copy-Item build\libkrunfw.dll dist\libkrunfw-windows-x86_64.dll -Force
+          Compress-Archive -Path stage\msb.exe, stage\libkrunfw.dll -DestinationPath dist\microsandbox-windows-x86_64.zip -Force
+          tar -czf dist\microsandbox-windows-x86_64.tar.gz -C stage msb.exe libkrunfw.dll
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-windows-x86_64
+          path: dist/*
+          compression-level: 0
+
+  # ---------------------------------------------------------------------------
+  # Collect every selected platform's assets, verify layout and checksums, then
+  # publish. Publishing happens only when publish_release is true (or a v* tag
+  # was pushed to the fork). All other runs keep the assets as an artifact.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Checksums and GitHub Release
+    needs: [plan, build-linux, build-macos, build-windows]
+    if: ${{ always() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TARGETS: ${{ needs.plan.outputs.targets }}
+      RESULT_LINUX: ${{ needs.build-linux.result }}
+      RESULT_DARWIN: ${{ needs.build-macos.result }}
+      RESULT_WINDOWS: ${{ needs.build-windows.result }}
+      PUBLISH: ${{ needs.plan.outputs.publish }}
+      TAG: ${{ needs.plan.outputs.tag }}
+      SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: release-artifacts
+          pattern: release-*
+          merge-multiple: true
+
+      - name: Verify selected builds and install.sh asset layout
+        run: |
+          python3 -I - <<'PY'
+          import fnmatch, json, os, sys, tarfile, zipfile
+          from pathlib import Path
+
+          root = Path("release-artifacts")
+          selected = json.loads(os.environ["TARGETS"])
+          results = {
+              "linux": os.environ["RESULT_LINUX"],
+              "darwin": os.environ["RESULT_DARWIN"],
+              "windows": os.environ["RESULT_WINDOWS"],
+          }
+          errors = []
+
+          def family(target):
+              return "linux" if target.startswith("linux-") else "darwin" if target.startswith("darwin-") else "windows"
+
+          for target in selected:
+              if results[family(target)] != "success":
+                  errors.append(f"{target}: build result is {results[family(target)]}")
+
+          def members(path):
+              if path.suffix == ".zip":
+                  with zipfile.ZipFile(path) as archive:
+                      return sorted(archive.namelist())
+              with tarfile.open(path, "r:gz") as archive:
+                  return sorted(member.name for member in archive.getmembers() if member.isfile())
+
+          def payload(names):
+              # macOS tar metadata (AppleDouble ._ entries) is not part of the bundle contract.
+              return [n for n in names if not os.path.basename(n).startswith("._")]
+
+          # install.sh expects exactly msb plus one runtime library per bundle.
+          for target in selected:
+              if target.startswith("linux-"):
+                  expected = [f"microsandbox-{target}.tar.gz", f"msb-{target}", f"libkrunfw-{target}.so"]
+                  library_pattern = "libkrunfw.so.5.*.*"
+              elif target.startswith("darwin-"):
+                  expected = [f"microsandbox-{target}.tar.gz", f"msb-{target}", f"libkrunfw-{target}.dylib"]
+                  library_pattern = "libkrunfw.*.dylib"
+              else:
+                  expected = [f"microsandbox-{target}.tar.gz", f"microsandbox-{target}.zip",
+                              f"msb-{target}.exe", f"libkrunfw-{target}.dll"]
+                  library_pattern = None
+              for name in expected:
+                  if not (root / name).is_file():
+                      errors.append(f"{target}: missing {name}")
+              if library_pattern is None:
+                  zip_path = root / f"microsandbox-{target}.zip"
+                  if zip_path.is_file() and sorted(payload(members(zip_path))) != ["libkrunfw.dll", "msb.exe"]:
+                      errors.append(f"{target}: zip members are {members(zip_path)}")
+                  tar_path = root / f"microsandbox-{target}.tar.gz"
+                  if tar_path.is_file() and sorted(payload(members(tar_path))) != ["libkrunfw.dll", "msb.exe"]:
+                      errors.append(f"{target}: tar members are {members(tar_path)}")
+                  continue
+              bundle = root / f"microsandbox-{target}.tar.gz"
+              if bundle.is_file():
+                  names = members(bundle)
+                  libraries = [n for n in names if n != "msb" and fnmatch.fnmatch(n, library_pattern)]
+                  if sorted(payload(names)) != sorted(["msb", *libraries]) or len(libraries) != 1:
+                      errors.append(f"{target}: bundle must contain exactly msb and one {library_pattern}, got {names}")
+
+          if errors:
+              print("\n".join(f"::error::{e}" for e in errors), file=sys.stderr)
+              sys.exit(1)
+          print("Selected builds and asset layout verified:", ", ".join(selected))
+          PY
+
+      - name: Generate checksums
+        working-directory: release-artifacts
+        run: |
+          set -euo pipefail
+          : > checksums.sha256
+          for file in *; do
+            [ -f "$file" ] && [ "$file" != checksums.sha256 ] || continue
+            sha256sum -- "$file" >> checksums.sha256
+          done
+          sort -k2 -o checksums.sha256 checksums.sha256
+          # install.sh requires exactly one checksum line per bundle name.
+          duplicates=$(awk '{print $2}' checksums.sha256 | sort | uniq -d)
+          if [ -n "$duplicates" ]; then
+            echo "::error::duplicate checksum entries: $duplicates" >&2
+            exit 1
+          fi
+          sha256sum --check --strict checksums.sha256
+          cat checksums.sha256
+
+      - name: Upload assets as workflow artifact
+        if: env.PUBLISH != 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fork-release-assets
+          path: release-artifacts/*
+          compression-level: 0
+
+      - name: Publish GitHub Release
+        if: env.PUBLISH == 'true'
+        run: |
+          set -euo pipefail
+          notes=$(mktemp)
+          {
+            echo "Fork build of ${TAG} from ${SOURCE_SHA}."
+            echo
+            echo "Assets: precompiled msb and libkrunfw for linux-x86_64, linux-aarch64, darwin-aarch64, windows-x86_64."
+            echo "Verify with: sha256sum --check checksums.sha256"
+          } > "$notes"
+          prerelease=()
+          case "$TAG" in
+            *-*) prerelease=(--prerelease --latest=false) ;;
+          esac
+          if gh release view "$TAG" >/dev/null; then
+            gh release upload "$TAG" release-artifacts/* --clobber
+          else
+            gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$notes" "${prerelease[@]}" release-artifacts/*
+          fi

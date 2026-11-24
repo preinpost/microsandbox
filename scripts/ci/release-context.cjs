@@ -3,12 +3,19 @@ const { releaseChannel } = require('./release-channel.cjs');
 
 const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim();
 
+// Only the upstream repository may publish. Forks keep the tag workflow for builds
+// but must never dispatch homebrew, publish packages, or push images.
+const UPSTREAM_REPOSITORY = 'superradcompany/microsandbox';
+
 // Recovery uses the workflow on main, but every artifact must use one immutable
 // source commit. Resolve once, before jobs with publishing credentials can run.
 async function resolveReleaseContext({ context, github, releaseTag = '', runGit = git }) {
   const recovery = context.eventName === 'workflow_dispatch' && releaseTag !== '';
   const tagPush = context.eventName === 'push' && context.ref.startsWith('refs/tags/v');
   if (!recovery && !tagPush) return { source_sha: context.sha, tag: '', publish: 'false' };
+  if (`${context.repo.owner}/${context.repo.repo}` !== UPSTREAM_REPOSITORY) {
+    return { source_sha: context.sha, tag: '', publish: 'false' };
+  }
   if (recovery && context.ref !== 'refs/heads/main') {
     throw new Error('Release recovery must run from main');
   }
